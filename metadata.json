@@ -1,0 +1,6 @@
+{
+  "name": "ATP Android Builder Online",
+  "description": "An on-device Android IDE and build system to create, clone, edit, compile, and build real Android APKs directly on device.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
