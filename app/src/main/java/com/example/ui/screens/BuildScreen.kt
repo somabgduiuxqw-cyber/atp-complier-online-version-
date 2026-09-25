@@ -5,6 +5,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
@@ -27,12 +29,17 @@ import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -61,6 +68,9 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.compiler.DebugKeystoreStatus
+import com.example.compiler.MemoryPressureLevel
+import com.example.compiler.RamSelection
 import com.example.model.BuildMode
 import com.example.model.BuildResult
 import com.example.model.StageState
@@ -71,6 +81,7 @@ import com.example.ui.theme.DarkSilver
 import com.example.ui.theme.LightSilver
 import com.example.ui.theme.PrimaryBlue
 import com.example.ui.theme.StatusGreen
+import com.example.ui.theme.StatusOrange
 import com.example.ui.theme.StatusRed
 
 @Composable
@@ -90,6 +101,10 @@ fun BuildScreen(
     val buildLogs by viewModel.compilerEngine.pipeline.buildLogs.collectAsState()
     val finalResult by viewModel.compilerEngine.pipeline.finalResult.collectAsState()
     val errorMessage by viewModel.compilerEngine.pipeline.errorMessage.collectAsState()
+
+    val selectedRam by viewModel.selectedRam.collectAsState()
+    val ramStatus by viewModel.ramStatus.collectAsState()
+    val keystoreVerification by viewModel.keystoreVerification.collectAsState()
 
     var showConfigDialog by remember { mutableStateOf(false) }
     var showFullLogDialog by remember { mutableStateOf(false) }
@@ -211,7 +226,193 @@ fun BuildScreen(
             }
         }
 
-        // Build Action Button
+        // Debug Keystore Manager Card
+        item {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("debug_keystore_card"),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+            ) {
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Security,
+                            contentDescription = null,
+                            tint = if (keystoreVerification.status == DebugKeystoreStatus.READY || keystoreVerification.status == DebugKeystoreStatus.REPAIRED) StatusGreen else StatusOrange,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Debug Keystore",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.weight(1f))
+
+                        Surface(
+                            shape = RoundedCornerShape(6.dp),
+                            color = when (keystoreVerification.status) {
+                                DebugKeystoreStatus.READY, DebugKeystoreStatus.REPAIRED -> StatusGreen.copy(alpha = 0.15f)
+                                DebugKeystoreStatus.REPAIRING -> PrimaryBlue.copy(alpha = 0.15f)
+                                else -> StatusRed.copy(alpha = 0.15f)
+                            }
+                        ) {
+                            Text(
+                                text = "Status: ${keystoreVerification.status.label}",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = when (keystoreVerification.status) {
+                                    DebugKeystoreStatus.READY, DebugKeystoreStatus.REPAIRED -> StatusGreen
+                                    DebugKeystoreStatus.REPAIRING -> PrimaryBlue
+                                    else -> StatusRed
+                                },
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = keystoreVerification.details,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { viewModel.verifyDebugKeystore() },
+                            enabled = !isBuilding,
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text("Verify", fontSize = 12.sp)
+                        }
+
+                        Button(
+                            onClick = { viewModel.repairDebugKeystore() },
+                            enabled = !isBuilding,
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(8.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue)
+                        ) {
+                            Text("Repair", fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
+
+        // RAM Manager Card
+        item {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("ram_manager_card"),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+            ) {
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Memory,
+                            contentDescription = null,
+                            tint = if (ramStatus.memoryPressure == MemoryPressureLevel.HIGH_PRESSURE) StatusRed else PrimaryBlue,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "RAM Manager",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.weight(1f))
+
+                        IconButton(
+                            onClick = { viewModel.refreshRamStatus() },
+                            modifier = Modifier.size(24.dp)
+                        ) {
+                            Icon(Icons.Default.Refresh, contentDescription = "Refresh RAM", modifier = Modifier.size(16.dp))
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "Total RAM: ${ramStatus.totalRamFormatted}",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "Available: ${ramStatus.availableRamFormatted}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (ramStatus.memoryPressure == MemoryPressureLevel.HIGH_PRESSURE) StatusRed else StatusGreen,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Status: ${ramStatus.statusText}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = when (ramStatus.memoryPressure) {
+                            MemoryPressureLevel.HIGH_PRESSURE -> StatusRed
+                            MemoryPressureLevel.MODERATE -> StatusOrange
+                            MemoryPressureLevel.NORMAL -> MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                    )
+
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Requested: ${ramStatus.requestedFormatted}  |  Using: ${ramStatus.allocatedFormatted}",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = "RAM Target Limit:",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+
+                    Spacer(modifier = Modifier.height(6.dp))
+                    // Horizontal scrollable RAM limits
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        RamSelection.entries.forEach { sel ->
+                            FilterChip(
+                                selected = selectedRam == sel,
+                                onClick = { viewModel.selectRam(sel) },
+                                label = { Text(sel.displayName, fontSize = 11.sp) },
+                                enabled = !isBuilding
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build Action Buttons
         item {
             if (isBuilding) {
                 Button(
@@ -228,22 +429,40 @@ fun BuildScreen(
                     Text("CANCEL BUILD", fontWeight = FontWeight.Bold)
                 }
             } else {
-                Button(
-                    onClick = { viewModel.startBuild() },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp)
-                        .testTag("start_build_button"),
-                    shape = RoundedCornerShape(10.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
-                    enabled = selectedProject != null
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Icon(Icons.Default.Build, contentDescription = null)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        "BUILD ${if (buildConfig.buildMode == BuildMode.RELEASE) "RELEASE" else "DEBUG"} APK",
-                        fontWeight = FontWeight.Bold
-                    )
+                    OutlinedButton(
+                        onClick = { viewModel.startBuild(ignoreAndBuild = true) },
+                        modifier = Modifier
+                            .weight(0.42f)
+                            .height(48.dp)
+                            .testTag("ignore_and_build_button"),
+                        shape = RoundedCornerShape(10.dp),
+                        enabled = selectedProject != null
+                    ) {
+                        Text("Ignore & Build", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                    }
+
+                    Button(
+                        onClick = { viewModel.startBuild(ignoreAndBuild = false) },
+                        modifier = Modifier
+                            .weight(0.58f)
+                            .height(48.dp)
+                            .testTag("start_build_button"),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                        enabled = selectedProject != null
+                    ) {
+                        Icon(Icons.Default.Build, contentDescription = null)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            "BUILD ${if (buildConfig.buildMode == BuildMode.RELEASE) "RELEASE" else "DEBUG"}",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp
+                        )
+                    }
                 }
             }
         }
@@ -275,7 +494,7 @@ fun BuildScreen(
                         }
                         Spacer(modifier = Modifier.height(6.dp))
                         Text(
-                            text = "All 10 build pipeline stages and deep APK structural verification completed.",
+                            text = "Genuine Android APK assembled, signed with RSA-2048, and verified successfully.",
                             style = MaterialTheme.typography.bodySmall
                         )
                         Spacer(modifier = Modifier.height(10.dp))
@@ -437,7 +656,7 @@ fun BuildScreen(
                     ) {
                         if (buildLogs.isEmpty()) {
                             Text(
-                                text = "Build console idle. Press BUILD APK to start compilation.",
+                                text = "Build console idle. Press BUILD to start compilation.",
                                 fontFamily = FontFamily.Monospace,
                                 fontSize = 11.sp,
                                 color = LightSilver.copy(alpha = 0.6f)

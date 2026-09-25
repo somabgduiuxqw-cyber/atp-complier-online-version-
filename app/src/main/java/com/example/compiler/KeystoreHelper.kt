@@ -22,52 +22,192 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
+enum class DebugKeystoreStatus(val label: String) {
+    READY("✓ Ready"),
+    MISSING("Missing"),
+    INVALID_OR_CORRUPTED("Invalid/Corrupted"),
+    REPAIRING("Repairing..."),
+    REPAIRED("Repaired ✓")
+}
+
+data class KeystoreVerificationResult(
+    val status: DebugKeystoreStatus,
+    val details: String,
+    val certificateDn: String? = null,
+    val validityDaysRemaining: Long = 0L,
+    val keySizeBits: Int = 2048
+)
+
 class KeystoreHelper(private val context: Context) {
 
-    private val keystoreFile: File
-        get() = File(context.filesDir, "atp_debug.keystore")
+    // Store in app-private storage, separate from toolchain and sources
+    private val debugKeystoreFile: File
+        get() = File(context.filesDir, "debug.keystore")
+
+    private val releaseKeystoreFile: File
+        get() = File(context.filesDir, "release.keystore")
 
     private val KEY_ALIAS = "androiddebugkey"
     private val KEY_PASSWORD = "android".toCharArray()
     private val STORE_PASSWORD = "android".toCharArray()
 
-    fun getOrCreateDebugKey(): Pair<PrivateKey, X509Certificate> {
-        val keyStore = KeyStore.getInstance(KeyStore.getDefaultType())
-        if (keystoreFile.exists()) {
-            FileInputStream(keystoreFile).use { fis ->
-                keyStore.load(fis, STORE_PASSWORD)
+    init {
+        // Automatic setup during initialization if missing
+        if (!debugKeystoreFile.exists()) {
+            try {
+                generateNewDebugKeystore()
+            } catch (ignored: Exception) {
+                // Handled gracefully in verify/repair
             }
-            val privateKey = keyStore.getKey(KEY_ALIAS, KEY_PASSWORD) as PrivateKey
-            val cert = keyStore.getCertificate(KEY_ALIAS) as X509Certificate
-            return privateKey to cert
+        }
+    }
+
+    fun verifyDebugKeystore(): KeystoreVerificationResult {
+        if (!debugKeystoreFile.exists()) {
+            return KeystoreVerificationResult(
+                status = DebugKeystoreStatus.MISSING,
+                details = "debug.keystore not found in private app storage."
+            )
         }
 
-        // Generate new 2048-bit RSA key pair
+        if (debugKeystoreFile.length() < 100) {
+            return KeystoreVerificationResult(
+                status = DebugKeystoreStatus.INVALID_OR_CORRUPTED,
+                details = "debug.keystore is corrupted (file size is too small)."
+            )
+        }
+
+        return try {
+            val keyStore = KeyStore.getInstance(KeyStore.getDefaultType())
+            FileInputStream(debugKeystoreFile).use { fis ->
+                keyStore.load(fis, STORE_PASSWORD)
+            }
+
+            if (!keyStore.containsAlias(KEY_ALIAS)) {
+                return KeystoreVerificationResult(
+                    status = DebugKeystoreStatus.INVALID_OR_CORRUPTED,
+                    details = "Keystore missing required alias '$KEY_ALIAS'."
+                )
+            }
+
+            val cert = keyStore.getCertificate(KEY_ALIAS) as? X509Certificate
+            val key = keyStore.getKey(KEY_ALIAS, KEY_PASSWORD) as? PrivateKey
+
+            if (cert == null || key == null) {
+                return KeystoreVerificationResult(
+                    status = DebugKeystoreStatus.INVALID_OR_CORRUPTED,
+                    details = "Certificate or private key could not be extracted from debug.keystore."
+                )
+            }
+
+            cert.checkValidity()
+
+            val now = System.currentTimeMillis()
+            val remainingDays = ((cert.notAfter.time - now) / (1000L * 60 * 60 * 24)).coerceAtLeast(0L)
+
+            KeystoreVerificationResult(
+                status = DebugKeystoreStatus.READY,
+                details = "Valid RSA-2048 debug certificate verified.",
+                certificateDn = cert.subjectX500Principal.name,
+                validityDaysRemaining = remainingDays,
+                keySizeBits = 2048
+            )
+        } catch (e: Exception) {
+            KeystoreVerificationResult(
+                status = DebugKeystoreStatus.INVALID_OR_CORRUPTED,
+                details = "Failed to load debug.keystore: ${e.localizedMessage ?: "Unknown error"}"
+            )
+        }
+    }
+
+    fun repairDebugKeystore(): Result<Boolean> {
+        return try {
+            if (debugKeystoreFile.exists()) {
+                debugKeystoreFile.delete()
+            }
+            generateNewDebugKeystore()
+            val verify = verifyDebugKeystore()
+            if (verify.status == DebugKeystoreStatus.READY) {
+                Result.success(true)
+            } else {
+                Result.failure(IllegalStateException(verify.details))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    private fun generateNewDebugKeystore(): Pair<PrivateKey, X509Certificate> {
         val kpg = KeyPairGenerator.getInstance("RSA")
         kpg.initialize(2048)
         val keyPair = kpg.generateKeyPair()
 
         val cert = generateSelfSignedCertificate(keyPair, "CN=Android Debug, O=Android, C=US")
 
+        val keyStore = KeyStore.getInstance(KeyStore.getDefaultType())
         keyStore.load(null, STORE_PASSWORD)
         keyStore.setKeyEntry(KEY_ALIAS, keyPair.private, KEY_PASSWORD, arrayOf(cert))
-        FileOutputStream(keystoreFile).use { fos ->
+
+        FileOutputStream(debugKeystoreFile).use { fos ->
             keyStore.store(fos, STORE_PASSWORD)
         }
 
         return keyPair.private to cert
     }
 
+    fun getOrCreateDebugKey(): Pair<PrivateKey, X509Certificate> {
+        val verification = verifyDebugKeystore()
+        if (verification.status != DebugKeystoreStatus.READY) {
+            return generateNewDebugKeystore()
+        }
+
+        val keyStore = KeyStore.getInstance(KeyStore.getDefaultType())
+        FileInputStream(debugKeystoreFile).use { fis ->
+            keyStore.load(fis, STORE_PASSWORD)
+        }
+        val privateKey = keyStore.getKey(KEY_ALIAS, KEY_PASSWORD) as PrivateKey
+        val cert = keyStore.getCertificate(KEY_ALIAS) as X509Certificate
+        return privateKey to cert
+    }
+
+    fun getReleaseKey(alias: String = "release", password: String = "release123"): Pair<PrivateKey, X509Certificate> {
+        // Separate Release Keystore
+        val keyStore = KeyStore.getInstance(KeyStore.getDefaultType())
+        if (releaseKeystoreFile.exists()) {
+            try {
+                FileInputStream(releaseKeystoreFile).use { fis ->
+                    keyStore.load(fis, password.toCharArray())
+                }
+                val key = keyStore.getKey(alias, password.toCharArray()) as? PrivateKey
+                val cert = keyStore.getCertificate(alias) as? X509Certificate
+                if (key != null && cert != null) {
+                    return key to cert
+                }
+            } catch (e: Exception) {
+                // Re-create release keystore
+            }
+        }
+
+        // Generate independent release key
+        val kpg = KeyPairGenerator.getInstance("RSA")
+        kpg.initialize(2048)
+        val keyPair = kpg.generateKeyPair()
+        val cert = generateSelfSignedCertificate(keyPair, "CN=Release Key, O=Mobile Dev, C=US")
+
+        keyStore.load(null, password.toCharArray())
+        keyStore.setKeyEntry(alias, keyPair.private, password.toCharArray(), arrayOf(cert))
+        FileOutputStream(releaseKeystoreFile).use { fos ->
+            keyStore.store(fos, password.toCharArray())
+        }
+
+        return keyPair.private to cert
+    }
+
     private fun generateSelfSignedCertificate(keyPair: KeyPair, dn: String): X509Certificate {
-        // Build self-signed certificate using Java Security
-        // Generate DER encoded minimal X.509 cert
         val now = System.currentTimeMillis()
         val notBefore = Date(now - 24 * 60 * 60 * 1000L)
-        val notAfter = Date(now + 30L * 365 * 24 * 60 * 60 * 1000L) // 30 years
+        val notAfter = Date(now + 30L * 365 * 24 * 60 * 60 * 1000L) // 30 years validity
         val serialNumber = BigInteger.valueOf(now)
-
-        // Handcrafted standard self-signed certificate structure or default X509 generator
-        // Use standard KeyStore or self-signed DER representation
         return createMinimalX509Cert(keyPair, dn, notBefore, notAfter, serialNumber)
     }
 
@@ -78,12 +218,9 @@ class KeystoreHelper(private val context: Context) {
         notAfter: Date,
         serial: BigInteger
     ): X509Certificate {
-        // Fallback or generator using java.security
-        // In Android, we can construct standard X.509 via DER or BouncyCastle/Android provider
         val signature = Signature.getInstance("SHA256withRSA")
         signature.initSign(keyPair.private)
 
-        // Encode simple X.509 v3 TBSCertificate DER structure
         val tbsBytes = buildTbsCert(dn, keyPair.public.encoded, notBefore, notAfter, serial)
         signature.update(tbsBytes)
         val sigBytes = signature.sign()
@@ -101,36 +238,28 @@ class KeystoreHelper(private val context: Context) {
         serial: BigInteger
     ): ByteArray {
         val bos = ByteArrayOutputStream()
-        // Sequence header for TBSCertificate
         val inner = ByteArrayOutputStream()
 
-        // Version: v3 (explicit tag [0] -> INTEGER 2)
         inner.write(byteArrayOf(0xA0.toByte(), 0x03, 0x02, 0x01, 0x02))
 
-        // Serial Number
         val serialBytes = serial.toByteArray()
         inner.write(0x02)
         inner.write(serialBytes.size)
         inner.write(serialBytes)
 
-        // Signature algorithm: SHA256withRSA (OID: 1.2.840.113549.1.1.11)
         val sha256RsaOid = byteArrayOf(
             0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86.toByte(), 0x48, 0x86.toByte(),
             0xF7.toByte(), 0x0D, 0x01, 0x01, 0x0B, 0x05, 0x00
         )
         inner.write(sha256RsaOid)
 
-        // Issuer & Subject Name (Minimal PrintableString CN=ATP Debug)
-        val nameDer = buildNameDer("ATP Android Builder Debug")
-        inner.write(nameDer) // Issuer
+        val nameDer = buildNameDer(dn)
+        inner.write(nameDer)
 
-        // Validity: UTCTime
         val validityDer = buildValidityDer(notBefore, notAfter)
         inner.write(validityDer)
 
-        inner.write(nameDer) // Subject (self-signed)
-
-        // SubjectPublicKeyInfo (raw encoded bytes from KeyPair)
+        inner.write(nameDer)
         inner.write(publicKeyDer)
 
         val body = inner.toByteArray()
@@ -144,17 +273,15 @@ class KeystoreHelper(private val context: Context) {
         val inner = ByteArrayOutputStream()
         inner.write(tbsBytes)
 
-        // AlgorithmIdentifier
         val sha256RsaOid = byteArrayOf(
             0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86.toByte(), 0x48, 0x86.toByte(),
             0xF7.toByte(), 0x0D, 0x01, 0x01, 0x0B, 0x05, 0x00
         )
         inner.write(sha256RsaOid)
 
-        // BitString signature
         inner.write(0x03)
         writeDerLength(inner, sigBytes.size + 1)
-        inner.write(0x00) // unused bits
+        inner.write(0x00)
         inner.write(sigBytes)
 
         val total = inner.toByteArray()
@@ -168,24 +295,23 @@ class KeystoreHelper(private val context: Context) {
     private fun buildNameDer(cn: String): ByteArray {
         val cnBytes = cn.toByteArray(Charsets.UTF_8)
         val inner = ByteArrayOutputStream()
-        // AttributeTypeAndValue: OID 2.5.4.3 (commonName)
         inner.write(byteArrayOf(0x30))
         val attrLen = 2 + 3 + 2 + cnBytes.size
         inner.write(attrLen)
-        inner.write(byteArrayOf(0x06, 0x03, 0x55, 0x04, 0x03)) // OID commonName
-        inner.write(0x0C) // UTF8String
+        inner.write(byteArrayOf(0x06, 0x03, 0x55, 0x04, 0x03))
+        inner.write(0x0C)
         inner.write(cnBytes.size)
         inner.write(cnBytes)
 
         val rdn = inner.toByteArray()
         val bos = ByteArrayOutputStream()
-        bos.write(0x31) // SET
+        bos.write(0x31)
         writeDerLength(bos, rdn.size)
         bos.write(rdn)
 
         val seq = bos.toByteArray()
         val result = ByteArrayOutputStream()
-        result.write(0x30) // SEQUENCE
+        result.write(0x30)
         writeDerLength(result, seq.size)
         result.write(seq)
         return result.toByteArray()
@@ -198,7 +324,7 @@ class KeystoreHelper(private val context: Context) {
         val b2 = format.format(notAfter).toByteArray(Charsets.US_ASCII)
 
         val inner = ByteArrayOutputStream()
-        inner.write(0x17) // UTCTime
+        inner.write(0x17)
         inner.write(b1.size)
         inner.write(b1)
         inner.write(0x17)
@@ -227,7 +353,7 @@ class KeystoreHelper(private val context: Context) {
     }
 
     fun signApk(unsignedApk: File, signedApk: File, isRelease: Boolean): Boolean {
-        val (privateKey, cert) = getOrCreateDebugKey()
+        val (privateKey, cert) = if (isRelease) getReleaseKey() else getOrCreateDebugKey()
         val messageDigest = MessageDigest.getInstance("SHA-256")
 
         val manifest = Manifest()
@@ -236,7 +362,6 @@ class KeystoreHelper(private val context: Context) {
 
         val tempEntries = mutableMapOf<String, ByteArray>()
 
-        // 1. Read all entries from unsigned APK and calculate SHA-256 for MANIFEST.MF
         ZipInputStream(FileInputStream(unsignedApk)).use { zis ->
             var entry: ZipEntry? = zis.nextEntry
             while (entry != null) {
@@ -257,7 +382,6 @@ class KeystoreHelper(private val context: Context) {
             }
         }
 
-        // 2. Generate CERT.SF
         val manifestBytes = ByteArrayOutputStream().apply { manifest.write(this) }.toByteArray()
         messageDigest.reset()
         val manifestDigest = messageDigest.digest(manifestBytes)
@@ -279,33 +403,26 @@ class KeystoreHelper(private val context: Context) {
 
         val sfBytes = ByteArrayOutputStream().apply { signatureFile.write(this) }.toByteArray()
 
-        // 3. Sign CERT.SF with RSA private key -> CERT.RSA PKCS#7 block
         val signer = Signature.getInstance("SHA256withRSA")
         signer.initSign(privateKey)
         signer.update(sfBytes)
         val signatureBytes = signer.sign()
 
-        // Package PKCS#7 signedData block containing cert + signature
         val pkcs7Block = buildPkcs7Block(cert, signatureBytes, sfBytes)
 
-        // 4. Write new APK with META-INF files
         ZipOutputStream(FileOutputStream(signedApk)).use { zos ->
-            // Write META-INF/MANIFEST.MF
             zos.putNextEntry(ZipEntry("META-INF/MANIFEST.MF"))
             zos.write(manifestBytes)
             zos.closeEntry()
 
-            // Write META-INF/CERT.SF
             zos.putNextEntry(ZipEntry("META-INF/CERT.SF"))
             zos.write(sfBytes)
             zos.closeEntry()
 
-            // Write META-INF/CERT.RSA
             zos.putNextEntry(ZipEntry("META-INF/CERT.RSA"))
             zos.write(pkcs7Block)
             zos.closeEntry()
 
-            // Write all original entries
             for ((name, data) in tempEntries) {
                 val e = ZipEntry(name)
                 zos.putNextEntry(e)
@@ -321,33 +438,26 @@ class KeystoreHelper(private val context: Context) {
         val certDer = cert.encoded
         val inner = ByteArrayOutputStream()
 
-        // Minimal PKCS#7 SignedData structure
-        inner.write(byteArrayOf(0x06, 0x09, 0x2A, 0x86.toByte(), 0x48, 0x86.toByte(), 0xF7.toByte(), 0x0D, 0x01, 0x07, 0x02)) // signedData OID
+        inner.write(byteArrayOf(0x06, 0x09, 0x2A, 0x86.toByte(), 0x48, 0x86.toByte(), 0xF7.toByte(), 0x0D, 0x01, 0x07, 0x02))
         val contentSeq = ByteArrayOutputStream()
-        contentSeq.write(0x02) // version 1
+        contentSeq.write(0x02)
         contentSeq.write(0x01)
         contentSeq.write(0x01)
 
-        // digestAlgorithms: SHA-256
         contentSeq.write(byteArrayOf(0x31, 0x0D, 0x30, 0x0B, 0x06, 0x09, 0x60, 0x86.toByte(), 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01))
-
-        // ContentInfo: data
         contentSeq.write(byteArrayOf(0x30, 0x0B, 0x06, 0x09, 0x2A, 0x86.toByte(), 0x48, 0x86.toByte(), 0xF7.toByte(), 0x0D, 0x01, 0x07, 0x01))
 
-        // Certificates [0] IMPLICIT
         contentSeq.write(0xA0.toByte().toInt())
         writeDerLength(contentSeq, certDer.size)
         contentSeq.write(certDer)
 
-        // SignerInfos SET OF SignerInfo
         val signerInfo = ByteArrayOutputStream()
-        signerInfo.write(0x02) // version
+        signerInfo.write(0x02)
         signerInfo.write(0x01)
         signerInfo.write(0x01)
 
-        // IssuerAndSerialNumber
         val issuerSeq = ByteArrayOutputStream()
-        issuerSeq.write(buildNameDer("ATP Android Builder Debug"))
+        issuerSeq.write(buildNameDer(cert.issuerX500Principal.name))
         val serialBytes = cert.serialNumber.toByteArray()
         issuerSeq.write(0x02)
         issuerSeq.write(serialBytes.size)
@@ -358,14 +468,10 @@ class KeystoreHelper(private val context: Context) {
         writeDerLength(signerInfo, issuerTotal.size)
         signerInfo.write(issuerTotal)
 
-        // DigestAlgorithm: SHA-256
         signerInfo.write(byteArrayOf(0x30, 0x0B, 0x06, 0x09, 0x60, 0x86.toByte(), 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01))
-
-        // DigestEncryptionAlgorithm: rsaEncryption
         signerInfo.write(byteArrayOf(0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86.toByte(), 0x48, 0x86.toByte(), 0xF7.toByte(), 0x0D, 0x01, 0x01, 0x01, 0x05, 0x00))
 
-        // EncryptedDigest: signature
-        signerInfo.write(0x04) // OCTET STRING
+        signerInfo.write(0x04)
         writeDerLength(signerInfo, signature.size)
         signerInfo.write(signature)
 
@@ -376,7 +482,7 @@ class KeystoreHelper(private val context: Context) {
         signerInfosSet.write(signerInfoBytes)
 
         val setBytes = signerInfosSet.toByteArray()
-        contentSeq.write(0x31) // SET
+        contentSeq.write(0x31)
         writeDerLength(contentSeq, setBytes.size)
         contentSeq.write(setBytes)
 

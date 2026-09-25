@@ -202,11 +202,38 @@ class ProjectRepository(
         sourceContent: String,
         projectName: String
     ): Project = withContext(Dispatchers.IO) {
+        val isXml = sourceFileName.endsWith(".xml", ignoreCase = true)
+        val isGradle = sourceFileName.endsWith(".gradle") || sourceFileName.endsWith(".gradle.kts")
+
+        if (isXml || isGradle) {
+            // Create default project and place XML/Gradle file into appropriate directory
+            val project = createProject(
+                name = projectName,
+                packageName = "com.atp.imported",
+                template = ProjectTemplate.EMPTY_ACTIVITY_KOTLIN
+            )
+            val targetFile = if (isXml) {
+                if (sourceFileName.equals("AndroidManifest.xml", ignoreCase = true)) {
+                    File(project.rootDirPath, "app/src/main/AndroidManifest.xml")
+                } else if (sourceFileName.contains("layout") || sourceFileName.startsWith("activity_") || sourceFileName.startsWith("fragment_")) {
+                    File(project.rootDirPath, "app/src/main/res/layout/$sourceFileName")
+                } else {
+                    File(project.rootDirPath, "app/src/main/res/values/$sourceFileName")
+                }
+            } else {
+                File(project.rootDirPath, "app/$sourceFileName")
+            }
+            targetFile.parentFile?.mkdirs()
+            targetFile.writeText(sourceContent)
+            return@withContext project
+        }
+
         // Extract package name from file content
         val packageRegex = Regex("""package\s+([a-zA-Z0-9_.]+)""")
         val match = packageRegex.find(sourceContent)
         val detectedPackage = match?.groupValues?.get(1) ?: "com.atp.imported"
         val isKotlin = sourceFileName.endsWith(".kt", ignoreCase = true)
+        val className = sourceFileName.substringBeforeLast('.')
 
         val template = if (isKotlin) ProjectTemplate.EMPTY_ACTIVITY_KOTLIN else ProjectTemplate.BASIC_ACTIVITY_JAVA
         val project = createProject(
@@ -217,10 +244,19 @@ class ProjectRepository(
 
         // Write the custom source file into the package structure
         val packageDir = detectedPackage.replace('.', '/')
-        val langDir = if (isKotlin) "java" else "java"
-        val targetFile = File(project.rootDirPath, "app/src/main/$langDir/$packageDir/$sourceFileName")
+        val targetFile = File(project.rootDirPath, "app/src/main/java/$packageDir/$sourceFileName")
         targetFile.parentFile?.mkdirs()
         targetFile.writeText(sourceContent)
+
+        // If the imported file has a custom activity class name, update AndroidManifest.xml
+        if (className != "MainActivity" && (sourceContent.contains("Activity") || sourceContent.contains("AppCompatActivity"))) {
+            val manifestFile = File(project.rootDirPath, "app/src/main/AndroidManifest.xml")
+            if (manifestFile.exists()) {
+                val manifestText = manifestFile.readText()
+                val updatedManifest = manifestText.replace(".MainActivity", ".$className")
+                manifestFile.writeText(updatedManifest)
+            }
+        }
 
         project
     }

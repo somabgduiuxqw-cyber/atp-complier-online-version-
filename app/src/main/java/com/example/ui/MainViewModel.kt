@@ -11,7 +11,10 @@ import androidx.lifecycle.viewModelScope
 import com.example.compiler.ApkVerifier
 import com.example.compiler.ElfInspector
 import com.example.compiler.KeystoreHelper
+import com.example.compiler.KeystoreVerificationResult
 import com.example.compiler.LocalCompilerEngine
+import com.example.compiler.RamSelection
+import com.example.compiler.RamStatus
 import com.example.data.db.BuilderDatabase
 import com.example.data.preferences.PreferenceManager
 import com.example.data.repository.BuildHistoryRepository
@@ -42,7 +45,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.io.File
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -96,6 +98,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private var buildJob: Job? = null
 
+    // RAM Manager State
+    private val _selectedRam = MutableStateFlow(RamSelection.AUTO)
+    val selectedRam: StateFlow<RamSelection> = _selectedRam.asStateFlow()
+
+    private val _ramStatus = MutableStateFlow(compilerEngine.ramManager.detectCurrentRamStatus(RamSelection.AUTO))
+    val ramStatus: StateFlow<RamStatus> = _ramStatus.asStateFlow()
+
+    // Debug Keystore State
+    private val _keystoreVerification = MutableStateFlow(keystoreHelper.verifyDebugKeystore())
+    val keystoreVerification: StateFlow<KeystoreVerificationResult> = _keystoreVerification.asStateFlow()
+
     // Storage
     private val _storageInfo = MutableStateFlow<StorageInfo?>(null)
     val storageInfo: StateFlow<StorageInfo?> = _storageInfo.asStateFlow()
@@ -116,8 +129,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             toolManager.initializeDefaultTools()
             refreshStorageInfo()
+            refreshRamStatus()
+            verifyDebugKeystore()
 
-            // Auto-select or create first project if none exists
             projectRepository.projects.collect { list ->
                 if (list.isNotEmpty() && _selectedProject.value == null) {
                     val activeId = preferenceManager.getActiveProjectId()
@@ -156,7 +170,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
             refreshNativeLibraries(project)
 
-            // Open main activity file in code editor
             val sourceDir = File(project.rootDirPath)
             val mainFile = findMainSourceFile(sourceDir)
             if (mainFile != null) {
@@ -298,18 +311,61 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         downloadManager.resumeDownload(toolId)
     }
 
+    // RAM Manager Actions
+    fun selectRam(selection: RamSelection) {
+        _selectedRam.value = selection
+        _ramStatus.value = compilerEngine.ramManager.detectCurrentRamStatus(selection)
+    }
+
+    fun refreshRamStatus() {
+        _ramStatus.value = compilerEngine.ramManager.detectCurrentRamStatus(_selectedRam.value)
+    }
+
+    // Debug Keystore Actions
+    fun verifyDebugKeystore() {
+        viewModelScope.launch(Dispatchers.IO) {
+            _keystoreVerification.value = keystoreHelper.verifyDebugKeystore()
+        }
+    }
+
+    fun repairDebugKeystore() {
+        viewModelScope.launch(Dispatchers.IO) {
+            _keystoreVerification.value = _keystoreVerification.value.copy(
+                status = com.example.compiler.DebugKeystoreStatus.REPAIRING,
+                details = "Repairing debug.keystore..."
+            )
+            val result = keystoreHelper.repairDebugKeystore()
+            if (result.isSuccess) {
+                _keystoreVerification.value = _keystoreVerification.value.copy(
+                    status = com.example.compiler.DebugKeystoreStatus.REPAIRED,
+                    details = "Debug keystore repaired and verified ✓"
+                )
+            } else {
+                _keystoreVerification.value = _keystoreVerification.value.copy(
+                    status = com.example.compiler.DebugKeystoreStatus.INVALID_OR_CORRUPTED,
+                    details = "Repair failed: ${result.exceptionOrNull()?.localizedMessage}"
+                )
+            }
+        }
+    }
+
     // Build Settings
     fun updateBuildConfig(transform: (BuildConfiguration) -> BuildConfiguration) {
         _buildConfig.value = transform(_buildConfig.value)
     }
 
     // Build Execution
-    fun startBuild() {
+    fun startBuild(ignoreAndBuild: Boolean = false) {
         val proj = _selectedProject.value ?: return
         if (compilerEngine.pipeline.isBuilding.value) return
 
         buildJob = viewModelScope.launch {
-            val result = compilerEngine.executeBuild(proj, _buildConfig.value)
+            val result = compilerEngine.executeBuild(
+                project = proj,
+                config = _buildConfig.value,
+                ramSelection = _selectedRam.value,
+                ignoreAndBuild = ignoreAndBuild
+            )
             if (result.isSuccess) {
                 _lastApkInfo.value = result.getOrNull()
             }
@@ -349,7 +405,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val abiDir = File(jniLibsDir, abi.dirName)
 
             if (!enable) {
-                // Remove ONLY that ABI directory
                 if (abiDir.exists()) {
                     abiDir.deleteRecursively()
                 }
