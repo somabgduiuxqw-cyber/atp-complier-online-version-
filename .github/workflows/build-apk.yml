@@ -1,4 +1,4 @@
-name: Build and Publish Debug AP
+name: Build and Publish Debug APK
 
 on:
   push:
@@ -166,21 +166,23 @@ jobs:
           RELEASE_TAG="debug-apk-build-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
           RELEASE_TITLE="Debug APK Build #${GITHUB_RUN_NUMBER}"
 
-          NOTES="### Debug APK Build #${GITHUB_RUN_NUMBER}
-
-- **Build Type**: Automatically generated debug APK
-- **Built By**: GitHub Actions
-- **Run Number**: ${GITHUB_RUN_NUMBER}
-- **Run Attempt**: ${GITHUB_RUN_ATTEMPT}
-- **Source Commit**: ${GITHUB_SHA}
-- **Purpose**: Testing and verification
-- **Notice**: This APK is intended for testing and is not a Play Store production release.
-- **Signing**: Signed with a temporary debug keystore."
+          printf "%s\n" \
+            "### Debug APK Build #${GITHUB_RUN_NUMBER}" \
+            "" \
+            "- **Build Type**: Automatically generated debug APK" \
+            "- **Built By**: GitHub Actions" \
+            "- **Run Number**: ${GITHUB_RUN_NUMBER}" \
+            "- **Run Attempt**: ${GITHUB_RUN_ATTEMPT}" \
+            "- **Source Commit**: ${GITHUB_SHA}" \
+            "- **Purpose**: Testing and verification" \
+            "- **Notice**: This APK is intended for testing and is not a Play Store production release." \
+            "- **Signing**: Signed with a temporary debug keystore." \
+            > release_notes.md
 
           gh release create "$RELEASE_TAG" "$ASSET_PATH" \
             --target "$GITHUB_SHA" \
             --title "$RELEASE_TITLE" \
-            --notes "$NOTES" \
+            --notes-file release_notes.md \
             --latest
 
       - name: Report APK download result
